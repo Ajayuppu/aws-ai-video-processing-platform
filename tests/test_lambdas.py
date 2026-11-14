@@ -17,7 +17,7 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(f"lambda_{name}", ROOT / "lambdas" / name / "app.py")
+    spec = importlib.util.spec_from_file_location(f"lambda_{name}", ROOT / "lambdas" / name / "lambda_function.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

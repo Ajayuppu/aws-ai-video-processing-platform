@@ -63,7 +63,7 @@ aws dynamodb delete-table --table-name VideoJobs >/dev/null 2>&1
 step "8. Delete the SNS topic (this also deletes its subscriptions)"
 aws sns delete-topic --topic-arn "arn:aws:sns:${REGION}:${ACCOUNT_ID}:video-ai-notifications" 2>/dev/null
 
-step "9. Delete ECS task definitions, the cluster, the ECR repository and the task log group"
+step "9. Delete ECS task definitions, the cluster, the ECR repository and the /ecs/video-processor log group"
 for td in $(aws ecs list-task-definitions --family-prefix video-processor-task --status ACTIVE --query 'taskDefinitionArns[]' --output text 2>/dev/null); do
   aws ecs deregister-task-definition --task-definition "$td" >/dev/null
 done
@@ -84,7 +84,7 @@ step "11. Turn off S3 -> EventBridge, empty and delete the bucket"
 aws s3api put-bucket-notification-configuration --bucket "$BUCKET" --notification-configuration '{}' 2>/dev/null
 aws s3 rb "s3://${BUCKET}" --force 2>/dev/null
 
-step "12. Delete the Step Functions log group (if you enabled logging) and the IAM roles"
+step "12. Delete the Step Functions log group and the IAM roles (including the pipeline and logging inline policies)"
 aws logs delete-log-group --log-group-name /aws/vendedlogs/states/video-ai-pipeline-Logs 2>/dev/null
 for role in "${ROLES[@]}"; do
   for p in $(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null); do

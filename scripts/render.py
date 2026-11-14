@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Fill the __PLACEHOLDER__ tokens in iam/, eventbridge/ and statemachine/ from config.env.
 
+Every *.json file in those folders is copied to build/ (including
+iam/policy-step-functions-logging.json, which has no placeholders).
+
 Usage:  python3 scripts/render.py config.env
 Output: build/<same relative paths>   (git-ignored; paste these into the console)
 """

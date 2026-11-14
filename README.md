@@ -14,19 +14,21 @@ S3 upload -> EventBridge -> SQS -> Lambda -> Step Functions
 
 The step-by-step console walkthrough (with screenshots) is in the blog post that goes with this repository. This README is the short version.
 
+Each Lambda lives in its own folder as `lambda_function.py` and exposes `handler` (the console default file name with a shorter function name). Set the runtime handler to `lambda_function.handler`.
+
 ## What is in the repo
 
 | Folder | Contents |
 |---|---|
 | `container/` | `Dockerfile` and `process.py`: FFmpeg audio and key frame extraction, runs on ECS Fargate |
-| `lambdas/start_job/` | SQS-triggered Lambda that starts one Step Functions execution per uploaded video |
+| `lambdas/start_job/` | SQS-triggered Lambda (`lambda_function.py`, handler `handler`) that starts one Step Functions execution per uploaded video |
 | `lambdas/update_status/` | Writes job progress to DynamoDB and publishes it to AppSync (SigV4) |
 | `lambdas/caption_frame/` | Captions one key frame with Amazon Nova 2 Lite (Bedrock Converse API) |
 | `lambdas/summarize/` | Creates title, summary and tags from the transcript and captions |
 | `statemachine/pipeline.asl.json` | The Step Functions workflow (JSONata) |
 | `appsync/` | GraphQL schema and the two JavaScript resolvers |
 | `web/index.html` | Static page that follows job progress over a WebSocket subscription |
-| `iam/`, `eventbridge/` | Least-privilege policies, trust policies, the EventBridge pattern and SQS policy |
+| `iam/`, `eventbridge/` | Least-privilege policies (including `iam/policy-step-functions-logging.json` for state-machine Error logging), trust policies, the EventBridge pattern and SQS policy |
 | `scripts/render.py` | Fills the `__PLACEHOLDER__` tokens from `config.env` |
 | `scripts/cleanup.sh` | Optional CLI cleanup of everything |
 | `tests/` | Offline unit tests for the Lambdas |
@@ -69,7 +71,7 @@ A 60 second video costs a few cents (Fargate for about a minute, Transcribe per 
 bash scripts/cleanup.sh config.env     # type "delete" to confirm
 ```
 
-The script removes the EventBridge rule, trigger, state machine, Lambdas and log groups, queues, AppSync API (set `APPSYNC_API_ID` in `config.env`), DynamoDB table, SNS topic, ECS task definitions and cluster, ECR repository, Transcribe jobs, the S3 bucket and the IAM roles.
+The script removes the EventBridge rule, trigger, state machine, Lambdas and their log groups, the `/ecs/video-processor` and Step Functions (`/aws/vendedlogs/states/video-ai-pipeline-Logs`) log groups, queues, AppSync API (set `APPSYNC_API_ID` in `config.env`), DynamoDB table, SNS topic, ECS task definitions and cluster, ECR repository, Transcribe jobs, the S3 bucket and the IAM roles (including the `pipeline` and `logging` inline policies on `video-pipeline-sfn-role`).
 
 ## Security notes
 
