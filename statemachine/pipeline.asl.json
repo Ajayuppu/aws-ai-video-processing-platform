@@ -1,0 +1,532 @@
+{
+  "Comment": "Event-driven AI video pipeline: Fargate (FFmpeg) -> Transcribe + Nova captions in parallel -> Nova summary -> DynamoDB/AppSync progress -> SNS email.",
+  "QueryLanguage": "JSONata",
+  "TimeoutSeconds": 1800,
+  "StartAt": "InitJob",
+  "States": {
+    "InitJob": {
+      "Type": "Pass",
+      "Comment": "Copy the input into variables so every later state can use them.",
+      "Assign": {
+        "jobId": "{% $states.input.jobId %}",
+        "bucket": "{% $states.input.bucket %}",
+        "videoKey": "{% $states.input.key %}",
+        "workPrefix": "{% 'work/' & $states.input.jobId & '/' %}"
+      },
+      "Next": "MarkStarted"
+    },
+    "MarkStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-update-status",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "status": "STARTED",
+          "progress": 5,
+          "message": "Job accepted",
+          "videoKey": "{% $videoKey %}"
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "ExtractMedia",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Could not start the job: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ]
+    },
+    "ExtractMedia": {
+      "Type": "Task",
+      "Comment": "Run the FFmpeg container on Fargate and wait until it exits (.sync).",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": 900,
+      "Arguments": {
+        "LaunchType": "FARGATE",
+        "Cluster": "arn:aws:ecs:__REGION__:__ACCOUNT_ID__:cluster/video-ai-cluster",
+        "TaskDefinition": "video-processor-task",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": [
+              "__SUBNET_1__",
+              "__SUBNET_2__"
+            ],
+            "SecurityGroups": [
+              "__SECURITY_GROUP__"
+            ],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "processor",
+              "Environment": [
+                {
+                  "Name": "BUCKET",
+                  "Value": "{% $bucket %}"
+                },
+                {
+                  "Name": "VIDEO_KEY",
+                  "Value": "{% $videoKey %}"
+                },
+                {
+                  "Name": "JOB_ID",
+                  "Value": "{% $jobId %}"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ECS.AmazonECSException"
+          ],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Media extraction failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ],
+      "Output": "{% $states.input %}",
+      "Next": "MarkExtracted"
+    },
+    "MarkExtracted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-update-status",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "status": "ANALYZING",
+          "progress": 45,
+          "message": "Audio and key frames extracted. Transcribing and captioning in parallel."
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "ListFrames",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Status update failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ]
+    },
+    "ListFrames": {
+      "Type": "Task",
+      "Comment": "Ask S3 directly (SDK integration, no Lambda) which key frames the container wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+      "Arguments": {
+        "Bucket": "{% $bucket %}",
+        "Prefix": "{% $workPrefix & 'frames/' %}"
+      },
+      "Assign": {
+        "frames": "{% $exists($states.result.Contents) ? [$states.result.Contents.Key] : [] %}"
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Listing frames failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ],
+      "Next": "AnalyzeInParallel"
+    },
+    "AnalyzeInParallel": {
+      "Type": "Parallel",
+      "Comment": "Branch 1: Amazon Transcribe. Branch 2: Map over frames, captioned by Amazon Nova.",
+      "Branches": [
+        {
+          "StartAt": "StartTranscription",
+          "States": {
+            "StartTranscription": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+              "Arguments": {
+                "TranscriptionJobName": "{% $jobId %}",
+                "LanguageCode": "en-US",
+                "Media": {
+                  "MediaFileUri": "{% 's3://' & $bucket & '/' & $workPrefix & 'audio.flac' %}"
+                },
+                "OutputBucketName": "{% $bucket %}",
+                "OutputKey": "{% 'results/' & $jobId & '/transcript.json' %}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Transcribe.LimitExceededException",
+                    "Transcribe.InternalFailureException"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "WaitForTranscription"
+            },
+            "WaitForTranscription": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "GetTranscription"
+            },
+            "GetTranscription": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+              "Arguments": {
+                "TranscriptionJobName": "{% $jobId %}"
+              },
+              "Next": "IsTranscriptionDone"
+            },
+            "IsTranscriptionDone": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Condition": "{% $states.input.TranscriptionJob.TranscriptionJobStatus = 'COMPLETED' %}",
+                  "Next": "TranscriptionDone"
+                },
+                {
+                  "Condition": "{% $states.input.TranscriptionJob.TranscriptionJobStatus = 'FAILED' %}",
+                  "Next": "TranscriptionFailed"
+                }
+              ],
+              "Default": "WaitForTranscription"
+            },
+            "TranscriptionDone": {
+              "Type": "Pass",
+              "Output": {
+                "transcriptKey": "{% 'results/' & $jobId & '/transcript.json' %}"
+              },
+              "End": true
+            },
+            "TranscriptionFailed": {
+              "Type": "Fail",
+              "Error": "TranscriptionFailed",
+              "Cause": "Amazon Transcribe reported FAILED for this job."
+            }
+          }
+        },
+        {
+          "StartAt": "CaptionFrames",
+          "States": {
+            "CaptionFrames": {
+              "Type": "Map",
+              "MaxConcurrency": 3,
+              "Items": "{% $frames %}",
+              "ItemSelector": {
+                "jobId": "{% $jobId %}",
+                "bucket": "{% $bucket %}",
+                "key": "{% $states.context.Map.Item.Value %}"
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "INLINE"
+                },
+                "StartAt": "CaptionFrame",
+                "States": {
+                  "CaptionFrame": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Arguments": {
+                      "FunctionName": "__LAMBDA_PREFIX__video-caption-frame",
+                      "Payload": "{% $states.input %}"
+                    },
+                    "Output": "{% $states.result.Payload %}",
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "Lambda.ServiceException",
+                          "Lambda.AWSLambdaException",
+                          "Lambda.SdkClientException",
+                          "Lambda.TooManyRequestsException"
+                        ],
+                        "IntervalSeconds": 2,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2,
+                        "JitterStrategy": "FULL"
+                      },
+                      {
+                        "ErrorEquals": [
+                          "States.TaskFailed"
+                        ],
+                        "IntervalSeconds": 5,
+                        "MaxAttempts": 2,
+                        "BackoffRate": 2,
+                        "JitterStrategy": "FULL"
+                      }
+                    ],
+                    "End": true
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Assign": {
+        "captions": "{% $states.result[1] %}"
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Analysis failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ],
+      "Next": "MarkSummarizing"
+    },
+    "MarkSummarizing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-update-status",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "status": "SUMMARIZING",
+          "progress": 80,
+          "message": "Transcript and frame captions ready. Summarizing with Amazon Nova."
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "Summarize",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Status update failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ]
+    },
+    "Summarize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-summarize",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "bucket": "{% $bucket %}",
+          "captions": "{% $captions %}"
+        }
+      },
+      "Assign": {
+        "insights": "{% $states.result.Payload %}"
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Summarizing failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ],
+      "Next": "MarkCompleted"
+    },
+    "MarkCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-update-status",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "status": "COMPLETED",
+          "progress": 100,
+          "message": "Done. Title, summary and tags are ready.",
+          "title": "{% $insights.title %}",
+          "summary": "{% $insights.summary %}",
+          "tags": "{% $insights.tags %}"
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "NotifySuccess",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed",
+          "Assign": {
+            "failureReason": "{% 'Status update failed: ' & $states.errorOutput.Error %}"
+          }
+        }
+      ]
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Arguments": {
+        "TopicArn": "arn:aws:sns:__REGION__:__ACCOUNT_ID__:video-ai-notifications",
+        "Subject": "{% 'Video processed: ' & $substring($insights.title, 0, 70) %}",
+        "Message": "{% 'Title: ' & $insights.title & '\\n\\nSummary: ' & $insights.summary & '\\n\\nTags: ' & $join($insights.tags, ', ') & '\\n\\nVideo: s3://' & $bucket & '/' & $videoKey & '\\nJob: ' & $jobId %}"
+      },
+      "Next": "JobSucceeded"
+    },
+    "JobSucceeded": {
+      "Type": "Succeed"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "__LAMBDA_PREFIX__video-update-status",
+        "Payload": {
+          "jobId": "{% $jobId %}",
+          "status": "FAILED",
+          "progress": 0,
+          "message": "{% $failureReason %}"
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Arguments": {
+        "TopicArn": "arn:aws:sns:__REGION__:__ACCOUNT_ID__:video-ai-notifications",
+        "Subject": "Video job failed",
+        "Message": "{% 'Job ' & $jobId & ' for s3://' & $bucket & '/' & $videoKey & ' failed.\\n\\nReason: ' & $failureReason %}"
+      },
+      "Next": "JobFailed"
+    },
+    "JobFailed": {
+      "Type": "Fail",
+      "Error": "VideoPipelineFailed",
+      "Cause": "{% $failureReason %}"
+    }
+  }
+}

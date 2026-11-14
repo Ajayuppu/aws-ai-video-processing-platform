@@ -1,0 +1,91 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeLambdas",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+        "arn:aws:lambda:__REGION__:__ACCOUNT_ID__:function:video-update-status",
+        "arn:aws:lambda:__REGION__:__ACCOUNT_ID__:function:video-caption-frame",
+        "arn:aws:lambda:__REGION__:__ACCOUNT_ID__:function:video-summarize"
+      ]
+    },
+    {
+      "Sid": "RunFargateTask",
+      "Effect": "Allow",
+      "Action": "ecs:RunTask",
+      "Resource": "arn:aws:ecs:__REGION__:__ACCOUNT_ID__:task-definition/video-processor-task:*"
+    },
+    {
+      "Sid": "WatchAndStopTask",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StopTask",
+        "ecs:DescribeTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsSyncManagedRule",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutTargets",
+        "events:PutRule",
+        "events:DescribeRule"
+      ],
+      "Resource": "arn:aws:events:__REGION__:__ACCOUNT_ID__:rule/StepFunctionsGetEventsForECSTaskRule"
+    },
+    {
+      "Sid": "PassEcsRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::__ACCOUNT_ID__:role/video-processor-execution-role",
+        "arn:aws:iam::__ACCOUNT_ID__:role/video-processor-task-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ListFrames",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::__BUCKET__",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "work/*"
+        }
+      }
+    },
+    {
+      "Sid": "TranscribeReadsAudioWritesTranscript",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::__BUCKET__/work/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::__BUCKET__/results/*"
+    },
+    {
+      "Sid": "Transcribe",
+      "Effect": "Allow",
+      "Action": [
+        "transcribe:StartTranscriptionJob",
+        "transcribe:GetTranscriptionJob"
+      ],
+      "Resource": "arn:aws:transcribe:__REGION__:__ACCOUNT_ID__:transcription-job/*"
+    },
+    {
+      "Sid": "Notify",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:__REGION__:__ACCOUNT_ID__:video-ai-notifications"
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Video Processing: live progress</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 860px; padding: 0 1rem; color: #232f3e; }
+    h1 { font-size: 1.5rem; }
+    .row { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+    input { padding: .4rem .6rem; border: 1px solid #aab7b8; border-radius: 4px; min-width: 260px; }
+    button { padding: .4rem .9rem; border: 0; border-radius: 4px; background: #ff9900; cursor: pointer; font-weight: 600; }
+    #conn { font-size: .85rem; padding: .15rem .6rem; border-radius: 999px; background: #eaeded; }
+    #conn.on { background: #d4f4dd; } #conn.off { background: #fde2e1; }
+    .card { border: 1px solid #d5dbdb; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .card h2 { margin: 0 0 .25rem; font-size: 1.05rem; }
+    .meta { font-size: .8rem; color: #545b64; }
+    .bar { height: 12px; background: #eaeded; border-radius: 6px; overflow: hidden; margin: .6rem 0; }
+    .bar > div { height: 100%; background: #1d8102; transition: width .4s; }
+    .FAILED .bar > div { background: #d13212; }
+    .tag { display: inline-block; background: #e9f1fa; color: #0a4a7c; border-radius: 4px; padding: .1rem .5rem; margin: .1rem; font-size: .8rem; }
+    .status { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>AI Video Processing: live progress</h1>
+  <p>Upload a video to <code>uploads/</code> in your S3 bucket and watch it move through the pipeline.</p>
+
+  <div class="row">
+    <input id="jobFilter" placeholder="Optional: only follow this jobId (job-...)" />
+    <button id="apply">Apply filter</button>
+    <button id="lookup">Look up job</button>
+    <span id="conn" class="off">disconnected</span>
+  </div>
+  <div id="jobs"></div>
+
+<script>
+  // ====== CONFIGURATION: copy these three values from the AppSync console (Settings page) ======
+  const GRAPHQL_URL = "https://REPLACE_WITH_API_ID.appsync-api.us-east-1.amazonaws.com/graphql";
+  const API_KEY     = "da2-REPLACE_WITH_YOUR_API_KEY";
+  // The real-time (WebSocket) endpoint is derived from the GraphQL URL below.
+  // =========================================================================================
+
+  const HOST = new URL(GRAPHQL_URL).host;
+  const REALTIME_URL = "wss://" + HOST.replace("appsync-api", "appsync-realtime-api") + "/graphql";
+  const FIELDS = "jobId status progress message videoKey title summary tags updatedAt";
+
+  const jobsEl = document.getElementById("jobs");
+  const connEl = document.getElementById("conn");
+  const jobs = new Map();           // jobId -> latest update
+  let socket = null, subId = null, retry = 0, keepAliveTimer = null, timeoutMs = 300000;
+
+  function render() {
+    const sorted = [...jobs.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    jobsEl.innerHTML = "";
+    for (const j of sorted) {
+      const card = document.createElement("div");
+      card.className = "card " + j.status;
+      const title = document.createElement("h2");
+      title.textContent = j.title || j.videoKey || j.jobId;
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = j.jobId + " · " + new Date(j.updatedAt).toLocaleTimeString();
+      const status = document.createElement("div");
+      const st = document.createElement("span");
+      st.className = "status"; st.textContent = j.status;
+      status.append(st, " (" + j.progress + "%) " + (j.message || ""));
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      const fill = document.createElement("div");
+      fill.style.width = j.progress + "%";
+      bar.append(fill);
+      card.append(title, meta, status, bar);
+      if (j.summary) { const p = document.createElement("p"); p.textContent = j.summary; card.append(p); }
+      for (const t of j.tags || []) { const s = document.createElement("span"); s.className = "tag"; s.textContent = t; card.append(s); }
+      jobsEl.append(card);
+    }
+  }
+
+  function setConn(on, text) { connEl.className = on ? "on" : "off"; connEl.textContent = text; }
+
+  function connect() {
+    const header = btoa(JSON.stringify({ host: HOST, "x-api-key": API_KEY }));
+    socket = new WebSocket(REALTIME_URL + "?header=" + header + "&payload=e30=", "graphql-ws");
+
+    socket.onopen = () => socket.send(JSON.stringify({ type: "connection_init" }));
+
+    socket.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case "connection_ack":
+          timeoutMs = msg.payload.connectionTimeoutMs || timeoutMs;
+          resetKeepAlive();
+          startSubscription();
+          break;
+        case "ka": resetKeepAlive(); break;
+        case "start_ack": setConn(true, "connected"); retry = 0; break;
+        case "data": {
+          const update = msg.payload.data.onJobUpdated;
+          if (update) { jobs.set(update.jobId, update); render(); }
+          break;
+        }
+        case "error": console.error("AppSync error", msg); setConn(false, "error (see console)"); break;
+      }
+    };
+
+    socket.onclose = () => {
+      clearTimeout(keepAliveTimer);
+      setConn(false, "disconnected, retrying...");
+      const delay = Math.min(30000, 1000 * 2 ** retry++) * (0.5 + Math.random() / 2);   // jittered backoff
+      setTimeout(connect, delay);
+    };
+  }
+
+  function resetKeepAlive() {
+    clearTimeout(keepAliveTimer);
+    keepAliveTimer = setTimeout(() => socket.close(), timeoutMs);   // no "ka" in time -> reconnect
+  }
+
+  function startSubscription() {
+    const filter = document.getElementById("jobFilter").value.trim();
+    const query = filter
+      ? `subscription Watch($jobId: ID) { onJobUpdated(jobId: $jobId) { ${FIELDS} } }`
+      : `subscription Watch { onJobUpdated { ${FIELDS} } }`;
+    subId = crypto.randomUUID();
+    socket.send(JSON.stringify({
+      id: subId,
+      type: "start",
+      payload: {
+        data: JSON.stringify({ query, variables: filter ? { jobId: filter } : {} }),
+        extensions: { authorization: { host: HOST, "x-api-key": API_KEY } },
+      },
+    }));
+  }
+
+  document.getElementById("apply").onclick = () => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "stop", id: subId }));
+      startSubscription();
+    }
+  };
+
+  document.getElementById("lookup").onclick = async () => {
+    const jobId = document.getElementById("jobFilter").value.trim();
+    if (!jobId) return alert("Type a jobId first.");
+    const res = await fetch(GRAPHQL_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ query: `query Get($jobId: ID!) { getJob(jobId: $jobId) { ${FIELDS} } }`, variables: { jobId } }),
+    });
+    const body = await res.json();
+    if (body.data && body.data.getJob) { jobs.set(jobId, body.data.getJob); render(); }
+    else alert(body.errors ? body.errors[0].message : "No such job.");
+  };
+
+  connect();
+</script>
+</body>
+</html>

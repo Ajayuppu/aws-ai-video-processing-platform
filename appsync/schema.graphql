@@ -1,0 +1,51 @@
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}
+
+# The API's default authorization mode is API key (used by the browser page).
+# AWS_IAM is an additional mode, used by the update-status Lambda to publish updates.
+# A type or field that must be reachable with BOTH modes needs BOTH directives.
+
+type JobUpdate @aws_api_key @aws_iam {
+  jobId: ID!
+  status: String!
+  progress: Int!
+  message: String
+  videoKey: String
+  title: String
+  summary: String
+  tags: [String]
+  updatedAt: AWSDateTime!
+}
+
+input JobUpdateInput {
+  jobId: ID!
+  status: String!
+  progress: Int!
+  message: String
+  videoKey: String
+  title: String
+  summary: String
+  tags: [String]
+  updatedAt: AWSDateTime!
+}
+
+type Query {
+  # Read one job from DynamoDB (API key).
+  getJob(jobId: ID!): JobUpdate @aws_api_key
+}
+
+type Mutation {
+  # Only the Lambda role (IAM) may call this. It has no data source side effects:
+  # it just echoes its input, which is what triggers the subscription below.
+  publishJobUpdate(input: JobUpdateInput!): JobUpdate @aws_iam
+}
+
+type Subscription {
+  # jobId is optional: omit it to receive every job, pass it to follow one job.
+  onJobUpdated(jobId: ID): JobUpdate
+    @aws_subscribe(mutations: ["publishJobUpdate"])
+    @aws_api_key
+}

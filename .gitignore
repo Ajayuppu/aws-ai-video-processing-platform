@@ -1,0 +1,11 @@
+config.env
+build/
+*.pem
+*.key
+.env
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# Lambda zips
+*.zip

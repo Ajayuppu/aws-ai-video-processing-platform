@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:__REGION__:__ACCOUNT_ID__:log-group:/aws/lambda/video-update-status:*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "dynamodb:UpdateItem",
+      "Resource": "arn:aws:dynamodb:__REGION__:__ACCOUNT_ID__:table/VideoJobs"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "appsync:GraphQL",
+      "Resource": "arn:aws:appsync:__REGION__:__ACCOUNT_ID__:apis/__APPSYNC_API_ID__/types/Mutation/fields/publishJobUpdate"
+    }
+  ]
+}
