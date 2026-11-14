@@ -57,13 +57,22 @@ step "6. Delete the AppSync API"
 API_ID="${APPSYNC_API_ID:-}"
 [ -n "$API_ID" ] && aws appsync delete-graphql-api --api-id "$API_ID" 2>/dev/null
 
-step "7. Delete the DynamoDB table"
+step "7. Remove the failure-test object uploads/bad.mp4 and any FAILED VideoJobs items"
+aws s3 rm "s3://${BUCKET}/uploads/bad.mp4" 2>/dev/null
+for id in $(aws dynamodb scan --table-name VideoJobs --filter-expression '#s = :f' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":f":{"S":"FAILED"}}' \
+    --query 'Items[].jobId.S' --output text 2>/dev/null); do
+  [ -n "$id" ] && aws dynamodb delete-item --table-name VideoJobs --key "{\"jobId\":{\"S\":\"$id\"}}"
+done
+
+step "8. Delete the DynamoDB table"
 aws dynamodb delete-table --table-name VideoJobs >/dev/null 2>&1
 
-step "8. Delete the SNS topic (this also deletes its subscriptions)"
+step "9. Delete the SNS topic (this also deletes its subscriptions)"
 aws sns delete-topic --topic-arn "arn:aws:sns:${REGION}:${ACCOUNT_ID}:video-ai-notifications" 2>/dev/null
 
-step "9. Delete ECS task definitions, the cluster, the ECR repository and the /ecs/video-processor log group"
+step "10. Delete ECS task definitions, the cluster, the ECR repository and the /ecs/video-processor log group"
 for td in $(aws ecs list-task-definitions --family-prefix video-processor-task --status ACTIVE --query 'taskDefinitionArns[]' --output text 2>/dev/null); do
   aws ecs deregister-task-definition --task-definition "$td" >/dev/null
 done
@@ -75,16 +84,16 @@ aws ecs delete-cluster --cluster video-ai-cluster >/dev/null 2>&1
 aws ecr delete-repository --repository-name video-processor --force >/dev/null 2>&1
 aws logs delete-log-group --log-group-name /ecs/video-processor 2>/dev/null
 
-step "10. Delete the Transcribe jobs (their names start with job-)"
+step "11. Delete the Transcribe jobs (their names start with job-)"
 for j in $(aws transcribe list-transcription-jobs --job-name-contains job- --query 'TranscriptionJobSummaries[].TranscriptionJobName' --output text 2>/dev/null); do
   aws transcribe delete-transcription-job --transcription-job-name "$j"
 done
 
-step "11. Turn off S3 -> EventBridge, empty and delete the bucket"
+step "12. Turn off S3 -> EventBridge, empty and delete the bucket (this also removes uploads/bad.mp4 if it is still there)"
 aws s3api put-bucket-notification-configuration --bucket "$BUCKET" --notification-configuration '{}' 2>/dev/null
 aws s3 rb "s3://${BUCKET}" --force 2>/dev/null
 
-step "12. Delete the Step Functions log group and the IAM roles (including the pipeline and logging inline policies)"
+step "13. Delete the Step Functions log group and the IAM roles (including the pipeline and logging inline policies)"
 aws logs delete-log-group --log-group-name /aws/vendedlogs/states/video-ai-pipeline-Logs 2>/dev/null
 for role in "${ROLES[@]}"; do
   for p in $(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null); do

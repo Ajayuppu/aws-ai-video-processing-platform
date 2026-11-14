@@ -492,7 +492,7 @@
         "Payload": {
           "jobId": "{% $jobId %}",
           "status": "FAILED",
-          "progress": 0,
+          "progress": 100,
           "message": "{% $failureReason %}"
         }
       },
